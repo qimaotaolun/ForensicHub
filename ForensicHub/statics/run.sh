@@ -1,6 +1,6 @@
 #!/bin/bash
 
-yaml_config="${yaml_config:-/mnt/data1/dubo/workspace/ForensicHub/ForensicHub/statics/aigc/dire_train.yaml}"
+yaml_config="${yaml_config:-/kaggle/working/ForensicHub/ForensicHub/statics/bisai/bisai_train.yaml}"
 
 # 从 yaml 中读取 gpus、log_dir 和 flag
 gpus=$(python -c "import yaml; print(yaml.safe_load(open('$yaml_config'))['gpus'])")
