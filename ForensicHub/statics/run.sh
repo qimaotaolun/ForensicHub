@@ -32,4 +32,4 @@ torchrun  \
     --nproc_per_node=${gpu_count} \
 ${script_path} \
    --config $yaml_config \
-2> ${base_dir}/error.log 1>${base_dir}/logs.log
+# 2> ${base_dir}/error.log 1>${base_dir}/logs.log
