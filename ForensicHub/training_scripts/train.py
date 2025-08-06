@@ -198,14 +198,14 @@ def main(args, model_args, train_dataset_args, test_dataset_args, transform_args
         )
 
         # # saving checkpoint
-        if args.output_dir and (epoch % 25 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir and ((epoch + 1) % 10 == 0 or epoch + 1 == args.epochs) or epoch == 0:
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
         optimizer.zero_grad()
         # test for one epoch
-        if epoch % args.test_period == 0 or epoch + 1 == args.epochs:
+        if (epoch + 1) % args.test_period == 0 or epoch + 1 == args.epochs:
             values = {}  # dict of dict (dataset_name: {metric_name: metric_value})
             # test across all datasets in the `test_data_loaders' dict
             for test_dataset_name, test_dataloader in test_dataloaders.items():

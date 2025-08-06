@@ -1,4 +1,3 @@
-import importlib
 from collections.abc import Callable
 from collections import abc
 from typing import Dict, List, Optional, Type, Union, Any
@@ -194,34 +193,9 @@ def register_evaluator(name: Optional[Union[str, List[str]]] = None, force: bool
 def build_from_registry(registry, config_args):
     # 从字典中获取 class 名称
     name = config_args["name"]  # 直接从字典中访问
-    if name in registry.module_dict.keys():
-        cls = registry.get(name)
-    else:
-        cls = None
-
-    # ========== 懒加载逻辑 ==========
+    cls = registry.get(name)
     if cls is None:
-        from ForensicHub.lazy_maps import get_all_lazy_maps
-        ALL_LAZY_MODEL_MAP, ALL_LAZY_POSTFUNC_MAP = get_all_lazy_maps()
-        lazy_map = ALL_LAZY_MODEL_MAP if registry is MODELS else ALL_LAZY_POSTFUNC_MAP
-        module_path = lazy_map.get(name, None)
-
-        if module_path is None:
-            raise ValueError(f"Class or function '{name}' not found in registry or lazy map.")
-
-        print(f"[lazy import] Loading '{name}' from '{module_path}'")
-        importlib.import_module(module_path)  # 动态加载
-
-        # ========== Deepfake 包装逻辑 ==========
-        flag = True
-        if registry is MODELS:
-            from ForensicHub.lazy_maps import _wrap_deepfake_if_needed
-            cls, flag = _wrap_deepfake_if_needed(cls, name)
-
-        if not flag: cls = registry.get(name)
-
-    if cls is None:
-        raise ImportError(f"'{name}' was not registered after importing '{module_path}'")
+        raise ValueError(f"Class '{name}' not found in registry.")
 
     # 获取 config 字典中的参数
     if "init_config" in config_args:
