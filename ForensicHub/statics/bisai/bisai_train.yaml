@@ -19,15 +19,15 @@ train_dataset:
   dataset_name: train
   init_config:
     image_size: 512
-    path: /ossfs/workspace/alldata/train/train.csv
-    root_dir: /ossfs/workspace/alldata/train
+    path: /kaggle/input/foren-tmp-data/_output_/train.csv
+    root_dir: /kaggle/input/foren-tmp-data/_output_/training_data
 #  Test dataset (one or many)
 test_dataset:
   - name: AIGCLabelDataset
     dataset_name: zhanwei
     init_config:
       image_size: 224
-      path: /ossfs/workspace/ForensicHub/ForensicHub/tasks/null.json
+      path: /kaggle/working/ForensicHub/ForensicHub/tasks/null.json
 
 # Transform
 transform:
