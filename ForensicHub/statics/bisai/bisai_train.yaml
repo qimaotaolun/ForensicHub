@@ -23,11 +23,12 @@ train_dataset:
     root_dir: /kaggle/input/foren-tmp-data/_output_/training_data
 #  Test dataset (one or many)
 test_dataset:
-  - name: AIGCLabelDataset
-    dataset_name: zhanwei
+  - name: BisaiDataset
+    dataset_name: test
     init_config:
-      image_size: 224
-      path: /kaggle/working/ForensicHub/ForensicHub/tasks/null.json
+      image_size: 512
+      path: /kaggle/input/foren-tmp-data/_output_/val.csv
+      root_dir: /kaggle/input/foren-tmp-data/_output_/training_data
 
 # Transform
 transform:
@@ -44,7 +45,7 @@ evaluator:
 # Training related
 batch_size: 8
 test_batch_size: 64
-epochs: 3
+epochs: 1
 accum_iter: 32
 record_epoch: 1  # Save the best only after record epoch.
 
