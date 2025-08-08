@@ -8,6 +8,7 @@ from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from pycocotools import mask as mask_util
 from ForensicHub.registry import MODELS, build_from_registry
+import torch.nn as nn # 导入 nn 模块
 
 def mask_to_rle(mask):
     mask = np.asfortranarray(mask.astype(np.uint8))
@@ -48,13 +49,29 @@ class ImageFolderDataset(Dataset):
 
 def infer_and_save_csv(input_dir, output_csv, model_args,
                        batch_size=16, num_workers=4, use_amp=True):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 检查 GPU 数量，并设置设备
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"检测到 {torch.cuda.device_count()} 个 GPU，将使用 DataParallel。")
+        device = torch.device("cuda:0") # 指定主设备为cuda:0
+        use_data_parallel = True
+    elif torch.cuda.is_available():
+        print("检测到单个 GPU，将在单个 GPU 上运行。")
+        device = torch.device("cuda")
+        use_data_parallel = False
+    else:
+        print("未检测到 GPU，将在 CPU 上运行。")
+        device = torch.device("cpu")
+        use_data_parallel = False
 
     # Load model
     model = build_from_registry(MODELS, model_args).to(device)
-    checkpoint = torch.load(model_args['init_path'], map_location=device)
+    checkpoint = torch.load(model_args['init_path'], map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"] if "model" in checkpoint else checkpoint)
     model.eval()
+
+    # 如果有多个 GPU，封装模型
+    if use_data_parallel:
+        model = nn.DataParallel(model) # 将模型封装在 DataParallel 中
 
     image_size = model_args['init_config'].get('image_size', 512)
     dataset = ImageFolderDataset(input_dir, image_size)
@@ -65,13 +82,26 @@ def infer_and_save_csv(input_dir, output_csv, model_args,
     results_dict = {} 
 
     for rel_paths, images in tqdm(dataloader, desc="Running inference"):
-        images = images.to(device)
+        images = images.to(device) # 将数据发送到主设备
         dummy_label = torch.ones(images.size(0), device=device)
         dummy_mask = torch.ones(images.size(0), 1, image_size, image_size, device=device)
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=use_amp):
                 out_dict = model(image=images, label=dummy_label, mask=dummy_mask)
+                # 当使用 DataParallel 时，输出可能被包装成一个列表或元组，需要处理
+                if use_data_parallel and isinstance(out_dict, list):
+                    # DataParallel 会在每个 GPU 上计算，然后合并结果。
+                    # 如果模型输出是字典，它会将字典的值转换为列表并合并。
+                    # 这里假设 out_dict 是一个字典，如果你的模型在DataParallel下
+                    # 返回的是一个字典，那么需要对字典的值进行合并
+                    # 通常情况下，DataParallel会自动处理这些。
+                    # 如果模型输出是张量，DataParallel会直接拼接张量。
+                    # 对于你的情况，model(image, label, mask) 返回的是一个字典，
+                    # DataParallel 会处理它并返回一个合并的字典。
+                    # 所以这里的逻辑可能不需要额外的处理，保留原样。
+                    pass # 不需要额外处理，因为 model 会返回一个合并的字典
+                
                 logits = out_dict["pred_label"]  # [B]
                 probs = torch.sigmoid(logits)    # [B]
                 pred_masks = torch.sigmoid(out_dict["pred_mask"]).cpu().numpy()  # [B, 1, H, W]
@@ -112,7 +142,7 @@ if __name__ == "__main__":
         input_dir=input_dir,
         output_csv=output_csv,
         model_args=model_args,
-        batch_size=64,
-        num_workers=32,
+        batch_size=128, # 批处理大小可以根据 GPU 数量和显存适当增大
+        num_workers=4,
         use_amp=True
     )
