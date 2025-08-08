@@ -9,7 +9,6 @@ from torch.utils.data import Dataset, DataLoader
 from pycocotools import mask as mask_util
 from ForensicHub.registry import MODELS, build_from_registry
 
-
 def mask_to_rle(mask):
     mask = np.asfortranarray(mask.astype(np.uint8))
     rle = mask_util.encode(mask)
@@ -100,13 +99,13 @@ def infer_and_save_csv(input_dir, output_csv, model_args,
 
 # Example usage
 if __name__ == "__main__":
-    input_dir = "/ossfs/workspace/alldata/testA"
-    output_csv = "./inference_results_testA.csv"
+    input_dir = "/kaggle/input/foren-tmp-data/_output_/testA_change"
+    output_csv = "inference_results_testA.csv"
     model_args = {
         "name": "BisaiBaseline",
         "init_config": {
         },
-        "init_path": "/ossfs/workspace/ForensicHub/log/bisai1/checkpoint-89.pth"
+        "init_path": "/kaggle/input/forensichub/pytorch/main/1/bisai1/checkpoint-19.pth"
     }
 
     infer_and_save_csv(
