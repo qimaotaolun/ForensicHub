@@ -10,7 +10,7 @@ class ConvNeXt(timm.models.convnext.ConvNeXt):
     def __init__(self,conv_pretrain=True):
         super(ConvNeXt, self).__init__(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536])
         if conv_pretrain:
-            print("Load Convnext pretrain.")
+            print("Load Convnext pretrain.And with Unet decoder.")
             model = timm.create_model('convnext_large', pretrained=True)
             self.load_state_dict(model.state_dict())
 
