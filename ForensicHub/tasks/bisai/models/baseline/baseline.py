@@ -4,14 +4,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 import os
-# from ForensicHub.registry import register_model
+from ForensicHub.registry import register_model
 
 class ConvNeXt(timm.models.convnext.ConvNeXt):
     def __init__(self,conv_pretrain=True):
         super(ConvNeXt, self).__init__(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536])
         if conv_pretrain:
             print("Load Convnext pretrain.And with Unet decoder.")
-            model = timm.create_model('convnext_large', pretrained=False)
+            model = timm.create_model('convnext_large', pretrained=True)
             self.load_state_dict(model.state_dict())
 
     def forward_features(self, x):
@@ -180,7 +180,7 @@ class DetectHead(nn.Module):
         feat = torch.cat([avg, max_], dim=1)
         return self.mlp(feat)
 
-# @register_model("BisaiBaseline")
+@register_model("BisaiBaseline")
 class BisaiBaseline(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
