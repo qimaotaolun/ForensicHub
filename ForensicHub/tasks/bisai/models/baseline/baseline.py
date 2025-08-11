@@ -140,9 +140,11 @@ class UnetDecoder(nn.Module):
         x = self.center(head)
         for i, decoder_block in enumerate(self.blocks):
             skip = skips[i] if i < len(skips) else None
+            if i == len(self.blocks) - 1:
+                out_detect = x
             x = decoder_block(x, skip)
 
-        return x
+        return x,out_detect
 
 # class UpsampleLocalHead(nn.Module):
 #     def __init__(self, in_channels, out_channels=1, up_factor=32):
@@ -185,7 +187,7 @@ class BisaiBaseline(nn.Module):
         self.backbone = ConvNeXt()
         # self.local_head = UpsampleLocalHead(in_channels=1536, out_channels=1, up_factor=32)
         self.local_head = UnetDecoder()
-        self.detect_head = DetectHead(in_channels=1536, hidden_dim=256, out_dim=1)
+        self.detect_head = DetectHead(in_channels=96, hidden_dim=256, out_dim=1)
 
 
     def forward(self, image, mask, label, *args, **kwargs):
@@ -194,18 +196,18 @@ class BisaiBaseline(nn.Module):
         B = image.size(0)
         
         # Step 1: backbone forward
-        feat, features = self.backbone.forward_features(image)  # feat: [B, C, H/32, W/32]
+        _, features = self.backbone.forward_features(image)  # feat: [B, C, H/32, W/32]
 
-        # Step 2: detect head — 全部参与
-        pred_logits = self.detect_head(feat).squeeze(dim=1)  # [B]
-        loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
-
-        # # Step 3: local head — 只对 mask 有效样本计算
-        pred_masks = self.local_head(*features)
+        # # Step 2: local head — 只对 mask 有效样本计算
+        pred_masks,out_detect = self.local_head(*features)
         loss_all = F.binary_cross_entropy_with_logits(
             pred_masks, mask.float(), reduction='none'  # [B, 1, H, W]
         )  # 每个像素的 loss
-
+        
+        # Step 3: detect head — 全部参与
+        pred_logits = self.detect_head(out_detect).squeeze(dim=1)  # [B]
+        loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
+        
         # Step 2: 平均成样本级别 [B]
         loss_per_sample = loss_all.view(loss_all.size(0), -1).mean(dim=1)  # [B]
 
