@@ -4,191 +4,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 import os
+from transformers import UperNetPreTrainedModel,UperNetForSemanticSegmentation,UperNetConfig
 from ForensicHub.registry import register_model
 
-class ConvNeXt(timm.models.convnext.ConvNeXt):
-    def __init__(self,conv_pretrain=True):
-        super(ConvNeXt, self).__init__(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536])
-        if conv_pretrain:
-            print("Load Convnext pretrain.And with Unet decoder.")
-            model = timm.create_model('convnext_large', pretrained=True)
-            self.load_state_dict(model.state_dict())
-
-    def forward_features(self, x):
-        x = self.stem(x)
-        out = []
-        for stage in self.stages:
-            x = stage(x)
-            out.append(x)
-        x = self.norm_pre(x)
-        return x , out
-
-class Conv2dReLU(nn.Sequential):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        padding=0,
-        stride=1,
-        use_batchnorm=True,
-    ):
-        conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            bias=not (use_batchnorm),
-        )
-        relu = nn.ReLU(inplace=True)
-        bn = nn.BatchNorm2d(out_channels)
-        super(Conv2dReLU, self).__init__(conv, bn, relu)
-
-class Attention(nn.Module):
-    def __init__(self, name, **params):
-        super().__init__()
-
-        if name is None:
-            self.attention = nn.Identity(**params)
-        else:
-            raise ValueError("Attention {} is not implemented".format(name))
-
-    def forward(self, x):
-        return self.attention(x)
-
-class DecoderBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        skip_channels,
-        out_channels,
-        use_batchnorm=True,
-        attention_type=None,
-    ):
-        super().__init__()
-        self.conv1 = Conv2dReLU(
-            in_channels + skip_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1,
-            use_batchnorm=use_batchnorm,
-        )
-        self.attention1 = Attention(
-            attention_type, in_channels=in_channels + skip_channels
-        )
-        self.conv2 = Conv2dReLU(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1,
-            use_batchnorm=use_batchnorm,
-        )
-        self.attention2 = Attention(attention_type, in_channels=out_channels)
-
-    def forward(self, x, skip=None):
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        if skip is not None:
-            x = torch.cat([x, skip], dim=1)
-            x = self.attention1(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.attention2(x)
-        return x
-
-class UnetDecoder(nn.Module):
-    def __init__(
-        self,
-        decoder_channels=[768, 384, 192, 96, 1],
-        n_blocks=5,
-        use_batchnorm=True,
-        attention_type=None,
-        dims=[96, 192, 384, 768, 1536]
-    ):
-        super().__init__()
-
-        if n_blocks != len(decoder_channels):
-            raise ValueError(
-                "Model depth is {}, but you provide `decoder_channels` for {} blocks.".format(
-                    n_blocks, len(decoder_channels)
-                )
-            )
-        # reverse channels to start from head of encoder
-        dims = dims[::-1]
-
-        # computing blocks input and output channels
-        head_channels =dims[0]
-        in_channels = [head_channels] + list(decoder_channels[:-1])
-        skip_channels = list(dims[1:-1]) + [0,0]
-        out_channels = decoder_channels
-        self.center = nn.Identity()
-        # combine decoder keyword arguments
-        kwargs = dict(use_batchnorm=use_batchnorm, attention_type=attention_type)
-        blocks = [
-            DecoderBlock(in_ch, skip_ch, out_ch, **kwargs)
-            for in_ch, skip_ch, out_ch in zip(in_channels, skip_channels, out_channels)
-        ]
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, *features):
-        # features = features[1:]  # remove first skip with same spatial resolution
-        features = features[::-1]  # reverse channels to start from head of encoder
-
-        head = features[0]
-        skips = features[1:]
-
-        x = self.center(head)
-        for i, decoder_block in enumerate(self.blocks):
-            skip = skips[i] if i < len(skips) else None
-            if i == len(self.blocks) - 1:
-                out_detect = x
-            x = decoder_block(x, skip)
-
-        return x,out_detect
-
-# class UpsampleLocalHead(nn.Module):
-#     def __init__(self, in_channels, out_channels=1, up_factor=32):
-#         super().__init__()
-#         self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
-#         self.bn1 = nn.BatchNorm2d(in_channels // 2)
-#         self.relu = nn.ReLU(inplace=True)
-#         self.out_conv = nn.Conv2d(in_channels // 2, out_channels, kernel_size=1)
-
-#         self.up_factor = up_factor
-
-#     def forward(self, x):
-#         x = self.relu(self.bn1(self.conv1(x)))
-#         x = self.out_conv(x)
-#         x = F.interpolate(x, scale_factor=self.up_factor, mode='bilinear', align_corners=False)
-#         return x
-
-
-class DetectHead(nn.Module):
-    def __init__(self, in_channels, hidden_dim=256, out_dim=1):
-        super().__init__()
-        self.pool_avg = nn.AdaptiveAvgPool2d(1)
-        self.pool_max = nn.AdaptiveMaxPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim)
-        )
-
-    def forward(self, x):
-        avg = self.pool_avg(x).flatten(1)
-        max_ = self.pool_max(x).flatten(1)
-        feat = torch.cat([avg, max_], dim=1)
-        return self.mlp(feat)
-
 @register_model("BisaiBaseline")
-class BisaiBaseline(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.backbone = ConvNeXt()
-        # self.local_head = UpsampleLocalHead(in_channels=1536, out_channels=1, up_factor=32)
-        self.local_head = UnetDecoder()
-        self.detect_head = DetectHead(in_channels=96, hidden_dim=256, out_dim=1)
+class BisaiBaseline(UperNetPreTrainedModel):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        config.num_labels = 2
+        self.transformer = UperNetForSemanticSegmentation(config)
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+        # 1. 首先加载 UperNetForSemanticSegmentation 模型及其预训练权重。
+        # 这一步会自动处理下载和权重加载，并将参数映射到 UperNetForSemanticSegmentation 的内部结构。
+        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights...")
+        upernet_model = UperNetForSemanticSegmentation.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        print("UperNetForSemanticSegmentation loaded successfully.")
 
+        # 2. 获取加载模型的配置。
+        config = upernet_model.config
+
+        # 3. 创建 BisaiBaseline 的实例。
+        # 此时，BisaiBaseline.__init__ 会被调用，并创建一个随机初始化的 self.transformer
+        model = cls(config)
+
+        # 4. 将第一步加载的、带有预训练权重的 upernet_model 赋值给 BisaiBaseline 实例的 self.transformer。
+        # 这样，所有 upernet_model 的参数就都被“嵌套”在 BisaiBaseline 的 'transformer.' 命名空间下。
+        model.transformer = upernet_model
+        print("Pretrained UperNetForSemanticSegmentation assigned to self.transformer.")
+        
+        return model
 
     def forward(self, image, mask, label, *args, **kwargs):
         # import pdb; pdb.set_trace()
@@ -196,17 +42,18 @@ class BisaiBaseline(nn.Module):
         B = image.size(0)
         
         # Step 1: backbone forward
-        _, features = self.backbone.forward_features(image)  # feat: [B, C, H/32, W/32]
+        outputs= self.transformer(image)  # feat: [B, C, H/32, W/32]
+        print(outputs.logits.shape)
 
         # # Step 2: local head — 只对 mask 有效样本计算
-        pred_masks,out_detect = self.local_head(*features)
+        pred_masks = torch.argmax(outputs.logits, dim=1, keepdim=True)  # [B, 1, H, W]
         loss_all = F.binary_cross_entropy_with_logits(
-            pred_masks, mask.float(), reduction='none'  # [B, 1, H, W]
+            pred_masks.float(), mask.float(), reduction='none'  # [B, 1, H, W]
         )  # 每个像素的 loss
         
-        # Step 3: detect head — 全部参与
-        pred_logits = self.detect_head(out_detect).squeeze(dim=1)  # [B]
-        loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
+        # # Step 3: detect head — 全部参与
+        # pred_logits = self.detect_head(out_detect).squeeze(dim=1)  # [B]
+        # loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
         
         # Step 2: 平均成样本级别 [B]
         loss_per_sample = loss_all.view(loss_all.size(0), -1).mean(dim=1)  # [B]
@@ -217,11 +64,13 @@ class BisaiBaseline(nn.Module):
         loss_mask = (loss_per_sample * mask_valid).sum() / (num_valid + 1e-6)
 
         return {
-            "backward_loss": loss_label + loss_mask,
+            "backward_loss": loss_mask,
+            # "backward_loss": loss_label + loss_mask,
             'pred_mask' : pred_masks,
-            'pred_label': pred_logits,
+            'pred_label': label,
             "visual_loss": {
-                "loss_label": loss_label,
+                # "loss_label": loss_label,
+                "loss_label": loss_mask,
                 "loss_mask": loss_mask,
             }
         }
@@ -229,8 +78,20 @@ class BisaiBaseline(nn.Module):
 def main():
     import torch
     import random
-    random.seed(42)
-    model = BisaiBaseline().to(0)
+    
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # For multi-GPU setups
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
+    # model = BisaiBaseline(config).to(device)
+    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=2,ignore_mismatched_sizes=True).to(device)
+    
     model.eval()
 
     B, C, H, W = 4, 3, 512, 512  # Batch size, channels, image size
@@ -249,7 +110,7 @@ def main():
 
     # 执行前向传播
     with torch.no_grad():
-        out = model(image.to(0), mask.to(0), label.to(0))
+        out = model(image.to(device), mask.to(device), label.to(device))
         
     # torch.onnx.export(
     #     model=model,
@@ -268,6 +129,21 @@ def main():
     print(f"backward_loss: {out['backward_loss'].item():.4f}")
     print(f"loss_label:    {out['visual_loss']['loss_label'].item():.4f}")
     print(f"loss_mask:     {out['visual_loss']['loss_mask'].item():.4f}")
+    
+    print(f"pred_mask:     {out['pred_mask'].shape}")
+    
+    print(f"param")
+    num_params = count_parameters(model)
+    print(f"模型的总可训练参数量: {num_params}")
+    # 或者以百万为单位打印
+    print(f"模型的总可训练参数量: {num_params / 1e6:.2f} M")
+        
+def count_parameters(model):
+    """
+    计算模型中可训练参数的总量。
+    """
+    return sum(p.numel() for p in model.parameters())
+    # return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 if __name__ == '__main__':
     main()
