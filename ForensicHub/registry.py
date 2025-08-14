@@ -212,8 +212,10 @@ def build_from_registry(registry, config_args):
                 config[k] = False
 
     print(f"[build_from_registry] Creating model '{name}' with args: {config}")
-    return cls.from_pretrained("openmmlab/upernet-convnext-large",**config)
-
+    if name == 'BisaiBaseline':
+        return cls.from_pretrained("openmmlab/upernet-convnext-large",**config)
+    else:
+        return cls(**config)
 
 def is_seq_of(seq: Any,
               expected_type: Union[Type, tuple],
