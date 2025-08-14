@@ -74,6 +74,12 @@ class BisaiBaseline(UperNetPreTrainedModel):
                 "loss_mask": loss_mask,
             }
         }
+    
+    def save_only_transformer(self, output_dir):
+        self.transformer.save_pretrained(output_dir)
+    
+    def load_only_transformer(self, input_dir):
+        self.transformer = UperNetForSemanticSegmentation.from_pretrained(input_dir).to(self.device)
 
 def main():
     import torch
@@ -88,9 +94,12 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
-    # model = BisaiBaseline(config).to(device)
-    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
+    config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
+    model = BisaiBaseline(config).to(device)
+    # model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
+    
+    # model.save_only_transformer("forensichub_checkpoint")
+    model.load_only_transformer("forensichub_checkpoint")
     
     model.eval()
 
