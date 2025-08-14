@@ -43,7 +43,7 @@ class BisaiBaseline(UperNetPreTrainedModel):
         
         # Step 1: backbone forward
         outputs= self.transformer(image)  # feat: [B, C, H/32, W/32]
-        print(outputs.logits.shape)
+        # print(outputs.logits.shape)
 
         # # Step 2: local head — 只对 mask 有效样本计算
         pred_masks = torch.argmax(outputs.logits, dim=1, keepdim=True)  # [B, 1, H, W]
