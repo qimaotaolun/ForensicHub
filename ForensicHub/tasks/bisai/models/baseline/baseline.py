@@ -11,7 +11,7 @@ from ForensicHub.registry import register_model
 class BisaiBaseline(UperNetPreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
-        config.num_labels = 2
+        config.num_labels = 1
         self.transformer = UperNetForSemanticSegmentation(config)
     
     @classmethod
@@ -46,9 +46,9 @@ class BisaiBaseline(UperNetPreTrainedModel):
         # print(outputs.logits.shape)
 
         # # Step 2: local head — 只对 mask 有效样本计算
-        pred_masks = torch.argmax(outputs.logits, dim=1, keepdim=True)  # [B, 1, H, W]
+        pred_masks = outputs.logits  # [B, 1, H, W]
         loss_all = F.binary_cross_entropy_with_logits(
-            pred_masks.float(), mask.float(), reduction='none'  # [B, 1, H, W]
+            pred_masks, mask.float(), reduction='none'  # [B, 1, H, W]
         )  # 每个像素的 loss
         
         # # Step 3: detect head — 全部参与
@@ -90,7 +90,7 @@ def main():
     
     # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
     # model = BisaiBaseline(config).to(device)
-    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=2,ignore_mismatched_sizes=True).to(device)
+    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
     
     model.eval()
 
