@@ -12,25 +12,48 @@ class BisaiBaseline(UperNetPreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         config.num_labels = 1
-        self.transformer = UperNetForSemanticSegmentation(config)
+        # 初始时不创建 transformer，因为 from_pretrained 会直接赋值
+        self.transformer = None # 或直接不初始化，因为它会在 from_pretrained 中被覆盖
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        # 1. 首先加载 UperNetForSemanticSegmentation 模型及其预训练权重。
-        # 这一步会自动处理下载和权重加载，并将参数映射到 UperNetForSemanticSegmentation 的内部结构。
-        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights...")
-        upernet_model = UperNetForSemanticSegmentation.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        print("UperNetForSemanticSegmentation loaded successfully.")
+        # 获取设备信息，用于加载预训练模型
+        # 这里需要注意，from_pretrained 可能会在多个场景下调用
+        # 如果是用于推理，你可能希望它直接加载到 CUDA 设备上
+        # 如果是用于训练，且使用DDP，则每个进程会单独加载
+        
+        # 在这里我们假设你希望将其加载到默认的 CUDA 设备，
+        # 如果后续会调用 .to(device) 或 DataParallel，这是一个合理的起点。
+        # 对于多GPU推理，通常加载到主设备'cuda:0'
+        
+        device = kwargs.pop("device", None) # 尝试从 kwargs 获取设备参数
+        if device is None and torch.cuda.is_available():
+            device = torch.device("cuda") 
+        elif device is None:
+            device = torch.device("cpu")
+            
+        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights to {device}...")
+        
+        # 1. 直接将预训练模型加载到指定设备
+        # transformers 库的 from_pretrained 方法通常支持 map_location
+        # 或者在较新版本中，直接通过 .to(device) 链式调用
+        upernet_model = UperNetForSemanticSegmentation.from_pretrained(
+            pretrained_model_name_or_path, 
+            *model_args, 
+            **kwargs
+        ).to(device) # <--- 关键改动：在这里立即移动到设备
+        
+        print("UperNetForSemanticSegmentation loaded successfully and moved to device.")
 
         # 2. 获取加载模型的配置。
         config = upernet_model.config
 
         # 3. 创建 BisaiBaseline 的实例。
-        # 此时，BisaiBaseline.__init__ 会被调用，并创建一个随机初始化的 self.transformer
+        # 注意：这里 __init__ 不再创建 transformer，因为我们将直接赋值
         model = cls(config)
 
         # 4. 将第一步加载的、带有预训练权重的 upernet_model 赋值给 BisaiBaseline 实例的 self.transformer。
-        # 这样，所有 upernet_model 的参数就都被“嵌套”在 BisaiBaseline 的 'transformer.' 命名空间下。
+        # 此时 upernet_model 已经位于正确的设备上
         model.transformer = upernet_model
         print("Pretrained UperNetForSemanticSegmentation assigned to self.transformer.")
         
@@ -94,9 +117,9 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
-    model = BisaiBaseline(config).to(device)
-    # model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
+    # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
+    # model = BisaiBaseline(config).to(device)
+    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True,device=device)
     
     # model.save_only_transformer("forensichub_checkpoint")
     model.load_only_transformer("forensichub_checkpoint")
