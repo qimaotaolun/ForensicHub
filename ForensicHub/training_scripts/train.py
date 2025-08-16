@@ -150,7 +150,6 @@ def main(args, model_args, train_dataset_args, test_dataset_args, transform_args
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     model.to(device)
-    model._init_time_related_weights()
 
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
