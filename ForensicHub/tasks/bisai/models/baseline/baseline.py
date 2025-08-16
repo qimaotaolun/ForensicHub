@@ -5,77 +5,82 @@ import torch.nn.functional as F
 import sys
 import os
 from transformers import UperNetPreTrainedModel,UperNetForSemanticSegmentation,UperNetConfig
+from timestep import Timesteps,TimestepEmbedding
 from ForensicHub.registry import register_model
-
+    
 @register_model("BisaiBaseline")
 class BisaiBaseline(UperNetPreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
+        # Timestep 
+        decoder_channels = [1536,768,384,192] # [192, 384, 768, 1536]
+        self.time_proj = Timesteps(decoder_channels[0], flip_sin_to_cos=True, downscale_freq_shift=0)
+        timestep_input_dim = decoder_channels[0]
+        self.time_embedding = TimestepEmbedding(timestep_input_dim, decoder_channels[0])
         config.num_labels = 1
-        # 初始时不创建 transformer，因为 from_pretrained 会直接赋值
-        self.transformer = None # 或直接不初始化，因为它会在 from_pretrained 中被覆盖
+        self.transformer = UperNetForSemanticSegmentation(config)
+        
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        # 获取设备信息，用于加载预训练模型
-        # 这里需要注意，from_pretrained 可能会在多个场景下调用
-        # 如果是用于推理，你可能希望它直接加载到 CUDA 设备上
-        # 如果是用于训练，且使用DDP，则每个进程会单独加载
-        
-        # 在这里我们假设你希望将其加载到默认的 CUDA 设备，
-        # 如果后续会调用 .to(device) 或 DataParallel，这是一个合理的起点。
-        # 对于多GPU推理，通常加载到主设备'cuda:0'
-        
-        device = kwargs.pop("device", None) # 尝试从 kwargs 获取设备参数
-        if device is None and torch.cuda.is_available():
-            device = torch.device("cuda") 
-        elif device is None:
-            device = torch.device("cpu")
-            
-        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights to {device}...")
-        
-        # 1. 直接将预训练模型加载到指定设备
-        # transformers 库的 from_pretrained 方法通常支持 map_location
-        # 或者在较新版本中，直接通过 .to(device) 链式调用
-        upernet_model = UperNetForSemanticSegmentation.from_pretrained(
-            pretrained_model_name_or_path, 
-            *model_args, 
-            **kwargs
-        ).to(device) # <--- 关键改动：在这里立即移动到设备
-        
-        print("UperNetForSemanticSegmentation loaded successfully and moved to device.")
+        # 1. 首先加载 UperNetForSemanticSegmentation 模型及其预训练权重。
+        # 这一步会自动处理下载和权重加载，并将参数映射到 UperNetForSemanticSegmentation 的内部结构。
+        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights...")
+        upernet_model = UperNetForSemanticSegmentation.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        print("UperNetForSemanticSegmentation loaded successfully.")
 
         # 2. 获取加载模型的配置。
         config = upernet_model.config
 
         # 3. 创建 BisaiBaseline 的实例。
-        # 注意：这里 __init__ 不再创建 transformer，因为我们将直接赋值
+        # 此时，BisaiBaseline.__init__ 会被调用，并创建一个随机初始化的 self.transformer
         model = cls(config)
 
         # 4. 将第一步加载的、带有预训练权重的 upernet_model 赋值给 BisaiBaseline 实例的 self.transformer。
-        # 此时 upernet_model 已经位于正确的设备上
+        # 这样，所有 upernet_model 的参数就都被“嵌套”在 BisaiBaseline 的 'transformer.' 命名空间下。
         model.transformer = upernet_model
+
         print("Pretrained UperNetForSemanticSegmentation assigned to self.transformer.")
         
         return model
 
     def forward(self, image, mask, label, *args, **kwargs):
+        # 1. time
+        timesteps = 0.222
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=image.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(image.device)
+
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        if image.shape[0]!=1:
+            timesteps = timesteps * torch.ones(image.shape[0], dtype=timesteps.dtype, device=timesteps.device)
+
+        t_emb = self.time_proj(timesteps)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        # t_emb = t_emb.to(dtype=self.dtype)
+        emb = self.time_embedding(t_emb)
+        
         # import pdb; pdb.set_trace()
         label = label.float()  # [B] or [B,1]
         B = image.size(0)
         
         # Step 1: backbone forward
-        outputs= self.transformer(image)  # feat: [B, C, H/32, W/32]
+        outputs= self.transformer(image,emb,output_hidden_states=True)  # feat: [B, C, H/32, W/32]
         # print(outputs.logits.shape)
 
-        # # Step 2: local head — 只对 mask 有效样本计算
+        # Step 2: local head — 只对 mask 有效样本计算
         pred_masks = outputs.logits  # [B, 1, H, W]
         loss_all = F.binary_cross_entropy_with_logits(
             pred_masks, mask.float(), reduction='none'  # [B, 1, H, W]
         )  # 每个像素的 loss
+
         
         # # Step 3: detect head — 全部参与
-        # pred_logits = self.detect_head(out_detect).squeeze(dim=1)  # [B]
+        # pred_logits = self.detect_head(feat).squeeze(dim=1)  # [B]
         # loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
         
         # Step 2: 平均成样本级别 [B]
@@ -90,13 +95,56 @@ class BisaiBaseline(UperNetPreTrainedModel):
             "backward_loss": loss_mask,
             # "backward_loss": loss_label + loss_mask,
             'pred_mask' : pred_masks,
-            'pred_label': label,
+            'pred_label': pred_masks,
             "visual_loss": {
                 # "loss_label": loss_label,
                 "loss_label": loss_mask,
                 "loss_mask": loss_mask,
             }
         }
+    
+    def _init_time_related_weights(self):
+        """
+        初始化与时间相关的层（bn_t 和 time_emb_proj）的参数。
+        这些层在加载原始 UperNetForSemanticSegmentation 检查点时通常是未初始化的。
+        """
+        # 定义需要初始化的层名称模式
+        bn_t_names = ["bn_t.bias", "bn_t.weight"]
+        time_emb_proj_names = ["time_emb_proj.bias", "time_emb_proj.weight"]
+        
+        # 记录均值和方差的名称，这些通常由BatchNorm层自动管理，但在初始化时需要归零
+        bn_t_running_stats_names = ["bn_t.running_mean", "bn_t.running_var", "bn_t.num_batches_tracked"]
+
+        print("Initializing newly added time-related weights...")
+
+        for name, module in self.named_modules():
+            # 检查是否是 BatchNorm 层，并初始化其 running_mean, running_var, num_batches_tracked
+            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d):
+                if any(bn_name in name for bn_name in ["bn_t"]): # 匹配 bn_t 层
+                    if module.running_mean is not None:
+                        nn.init.zeros_(module.running_mean)
+                    if module.running_var is not None:
+                        nn.init.ones_(module.running_var) # 方差通常初始化为1
+                    if hasattr(module, 'num_batches_tracked') and module.num_batches_tracked is not None:
+                        module.num_batches_tracked.zero_()
+                    
+                    # 对于可学习的参数（affine=True时），通常按照标准BN初始化
+                    if module.affine:
+                        nn.init.ones_(module.weight) # weight (gamma) 初始化为1
+                        nn.init.zeros_(module.bias)  # bias (beta) 初始化为0
+                    # print(f"Initialized BatchNorm layer: {name}")
+
+            # 检查是否是 Linear 层（time_emb_proj）
+            if isinstance(module, nn.Linear):
+                if any(proj_name in name for proj_name in ["time_emb_proj"]): # 匹配 time_emb_proj
+                    # 权重使用正态分布初始化
+                    nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+                    # 偏差初始化为零
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                    # print(f"Initialized Linear layer: {name}")
+
+        print("Finished initializing time-related weights.")
     
     def save_only_transformer(self, output_dir):
         self.transformer.save_pretrained(output_dir)
@@ -117,13 +165,15 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
-    # model = BisaiBaseline(config).to(device)
-    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True,device=device)
+    config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
+    model = BisaiBaseline(config).to(device)
+    # model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
     
     # model.save_only_transformer("forensichub_checkpoint")
     model.load_only_transformer("forensichub_checkpoint")
     
+    model._init_time_related_weights()
+
     model.eval()
 
     B, C, H, W = 4, 3, 512, 512  # Batch size, channels, image size
@@ -169,13 +219,14 @@ def main():
     print(f"模型的总可训练参数量: {num_params}")
     # 或者以百万为单位打印
     print(f"模型的总可训练参数量: {num_params / 1e6:.2f} M")
+    # print(f"model: {model}")
         
 def count_parameters(model):
     """
     计算模型中可训练参数的总量。
     """
-    return sum(p.numel() for p in model.parameters())
-    # return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # return sum(p.numel() for p in model.parameters()) # 计算所有参数
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) # 只计算需要梯度的参数
 
 if __name__ == '__main__':
     main()
