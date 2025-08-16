@@ -1,212 +1,197 @@
 import timm
 import torch 
+import math
+from typing import Optional
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
 import os
-# from ForensicHub.registry import register_model
+from transformers import UperNetPreTrainedModel,UperNetForSemanticSegmentation,UperNetConfig
+from ForensicHub.registry import register_model
 
-class ConvNeXt(timm.models.convnext.ConvNeXt):
-    def __init__(self,conv_pretrain=True):
-        super(ConvNeXt, self).__init__(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536])
-        if conv_pretrain:
-            print("Load Convnext pretrain.And with Unet decoder.")
-            model = timm.create_model('convnext_large', pretrained=False)
-            self.load_state_dict(model.state_dict())
+def get_timestep_embedding(
+    timesteps: torch.Tensor,
+    embedding_dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+):
+    """
+    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
 
-    def forward_features(self, x):
-        x = self.stem(x)
-        out = []
-        for stage in self.stages:
-            x = stage(x)
-            out.append(x)
-        x = self.norm_pre(x)
-        return x , out
+    Args
+        timesteps (torch.Tensor):
+            a 1-D Tensor of N indices, one per batch element. These may be fractional.
+        embedding_dim (int):
+            the dimension of the output.
+        flip_sin_to_cos (bool):
+            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
+        downscale_freq_shift (float):
+            Controls the delta between frequencies between dimensions
+        scale (float):
+            Scaling factor applied to the embeddings.
+        max_period (int):
+            Controls the maximum frequency of the embeddings
+    Returns
+        torch.Tensor: an [N x dim] Tensor of positional embeddings.
+    """
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
-class Conv2dReLU(nn.Sequential):
+    half_dim = embedding_dim // 2
+    exponent = -math.log(max_period) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
+    exponent = exponent / (half_dim - downscale_freq_shift)
+
+    emb = torch.exp(exponent)
+    emb = timesteps[:, None].float() * emb[None, :]
+
+    # scale embeddings
+    emb = scale * emb
+
+    # concat sine and cosine embeddings
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+
+    # flip sine and cosine embeddings
+    if flip_sin_to_cos:
+        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+
+    # zero pad
+    if embedding_dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+
+class Timesteps(nn.Module):
+    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
+        super().__init__()
+        self.num_channels = num_channels
+        self.flip_sin_to_cos = flip_sin_to_cos
+        self.downscale_freq_shift = downscale_freq_shift
+        self.scale = scale
+
+    def forward(self, timesteps):
+        t_emb = get_timestep_embedding(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
+        return t_emb
+
+class TimestepEmbedding(nn.Module):
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        padding=0,
-        stride=1,
-        use_batchnorm=True,
+        in_channels: int,
+        time_embed_dim: int,
+        out_dim: int = None,
+        cond_proj_dim=None,
+        sample_proj_bias=True,
     ):
-        conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            bias=not (use_batchnorm),
-        )
-        relu = nn.ReLU(inplace=True)
-        bn = nn.BatchNorm2d(out_channels)
-        super(Conv2dReLU, self).__init__(conv, bn, relu)
-
-class Attention(nn.Module):
-    def __init__(self, name, **params):
         super().__init__()
 
-        if name is None:
-            self.attention = nn.Identity(**params)
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
+
+        if cond_proj_dim is not None:
+            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
         else:
-            raise ValueError("Attention {} is not implemented".format(name))
+            self.cond_proj = None
 
-    def forward(self, x):
-        return self.attention(x)
+        self.act = nn.SiLU()
 
-class DecoderBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        skip_channels,
-        out_channels,
-        use_batchnorm=True,
-        attention_type=None,
-    ):
-        super().__init__()
-        self.conv1 = Conv2dReLU(
-            in_channels + skip_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1,
-            use_batchnorm=use_batchnorm,
-        )
-        self.attention1 = Attention(
-            attention_type, in_channels=in_channels + skip_channels
-        )
-        self.conv2 = Conv2dReLU(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1,
-            use_batchnorm=use_batchnorm,
-        )
-        self.attention2 = Attention(attention_type, in_channels=out_channels)
+        if out_dim is not None:
+            time_embed_dim_out = out_dim
+        else:
+            time_embed_dim_out = time_embed_dim
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, sample_proj_bias)
 
-    def forward(self, x, skip=None):
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        if skip is not None:
-            x = torch.cat([x, skip], dim=1)
-            x = self.attention1(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.attention2(x)
-        return x
+    def forward(self, sample, condition=None):
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
 
-class UnetDecoder(nn.Module):
-    def __init__(
-        self,
-        decoder_channels=[768, 384, 192, 96, 1],
-        n_blocks=5,
-        use_batchnorm=True,
-        attention_type=None,
-        dims=[96, 192, 384, 768, 1536]
-    ):
-        super().__init__()
+        sample = self.act(sample)
 
-        if n_blocks != len(decoder_channels):
-            raise ValueError(
-                "Model depth is {}, but you provide `decoder_channels` for {} blocks.".format(
-                    n_blocks, len(decoder_channels)
-                )
-            )
-        # reverse channels to start from head of encoder
-        dims = dims[::-1]
+        sample = self.linear_2(sample)
+        sample = self.act(sample)
+        return sample
+    
+@register_model("BisaiBaseline")
+class BisaiBaseline(UperNetPreTrainedModel):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        # Timestep 
+        decoder_channels = [1536,768,384,192] # [192, 384, 768, 1536]
+        self.time_proj = Timesteps(decoder_channels[0], flip_sin_to_cos=True, downscale_freq_shift=0)
+        timestep_input_dim = decoder_channels[0]
+        self.time_embedding = TimestepEmbedding(timestep_input_dim, decoder_channels[0])
+        config.num_labels = 1
+        self.transformer = UperNetForSemanticSegmentation(config)
+        
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+        # 1. 首先加载 UperNetForSemanticSegmentation 模型及其预训练权重。
+        # 这一步会自动处理下载和权重加载，并将参数映射到 UperNetForSemanticSegmentation 的内部结构。
+        print(f"Loading UperNetForSemanticSegmentation from '{pretrained_model_name_or_path}' with pretrained weights...")
+        upernet_model = UperNetForSemanticSegmentation.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        print("UperNetForSemanticSegmentation loaded successfully.")
 
-        # computing blocks input and output channels
-        head_channels =dims[0]
-        in_channels = [head_channels] + list(decoder_channels[:-1])
-        skip_channels = list(dims[1:-1]) + [0,0]
-        out_channels = decoder_channels
-        self.center = nn.Identity()
-        # combine decoder keyword arguments
-        kwargs = dict(use_batchnorm=use_batchnorm, attention_type=attention_type)
-        blocks = [
-            DecoderBlock(in_ch, skip_ch, out_ch, **kwargs)
-            for in_ch, skip_ch, out_ch in zip(in_channels, skip_channels, out_channels)
-        ]
-        self.blocks = nn.ModuleList(blocks)
+        # 2. 获取加载模型的配置。
+        config = upernet_model.config
 
-    def forward(self, *features):
-        # features = features[1:]  # remove first skip with same spatial resolution
-        features = features[::-1]  # reverse channels to start from head of encoder
+        # 3. 创建 BisaiBaseline 的实例。
+        # 此时，BisaiBaseline.__init__ 会被调用，并创建一个随机初始化的 self.transformer
+        model = cls(config)
 
-        head = features[0]
-        skips = features[1:]
+        # 4. 将第一步加载的、带有预训练权重的 upernet_model 赋值给 BisaiBaseline 实例的 self.transformer。
+        # 这样，所有 upernet_model 的参数就都被“嵌套”在 BisaiBaseline 的 'transformer.' 命名空间下。
+        model.transformer = upernet_model
 
-        x = self.center(head)
-        for i, decoder_block in enumerate(self.blocks):
-            skip = skips[i] if i < len(skips) else None
-            x = decoder_block(x, skip)
-
-        return x
-
-# class UpsampleLocalHead(nn.Module):
-#     def __init__(self, in_channels, out_channels=1, up_factor=32):
-#         super().__init__()
-#         self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
-#         self.bn1 = nn.BatchNorm2d(in_channels // 2)
-#         self.relu = nn.ReLU(inplace=True)
-#         self.out_conv = nn.Conv2d(in_channels // 2, out_channels, kernel_size=1)
-
-#         self.up_factor = up_factor
-
-#     def forward(self, x):
-#         x = self.relu(self.bn1(self.conv1(x)))
-#         x = self.out_conv(x)
-#         x = F.interpolate(x, scale_factor=self.up_factor, mode='bilinear', align_corners=False)
-#         return x
-
-
-class DetectHead(nn.Module):
-    def __init__(self, in_channels, hidden_dim=256, out_dim=1):
-        super().__init__()
-        self.pool_avg = nn.AdaptiveAvgPool2d(1)
-        self.pool_max = nn.AdaptiveMaxPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim)
-        )
-
-    def forward(self, x):
-        print(x.shape)
-        avg = self.pool_avg(x).flatten(1)
-        max_ = self.pool_max(x).flatten(1)
-        feat = torch.cat([avg, max_], dim=1)
-        return self.mlp(feat)
-
-# @register_model("BisaiBaseline")
-class BisaiBaseline(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.backbone = ConvNeXt()
-        # self.local_head = UpsampleLocalHead(in_channels=1536, out_channels=1, up_factor=32)
-        self.local_head = UnetDecoder()
-        self.detect_head = DetectHead(in_channels=1536, hidden_dim=256, out_dim=1)
-
+        print("Pretrained UperNetForSemanticSegmentation assigned to self.transformer.")
+        
+        return model
 
     def forward(self, image, mask, label, *args, **kwargs):
+        # 1. time
+        timesteps = 0.222
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=image.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(image.device)
+
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        if image.shape[0]!=1:
+            timesteps = timesteps * torch.ones(image.shape[0], dtype=timesteps.dtype, device=timesteps.device)
+
+        t_emb = self.time_proj(timesteps)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        # t_emb = t_emb.to(dtype=self.dtype)
+        emb = self.time_embedding(t_emb)
+        
         # import pdb; pdb.set_trace()
         label = label.float()  # [B] or [B,1]
         B = image.size(0)
         
         # Step 1: backbone forward
-        feat, features = self.backbone.forward_features(image)  # feat: [B, C, H/32, W/32]
+        outputs= self.transformer(image,emb,output_hidden_states=True)  # feat: [B, C, H/32, W/32]
+        # print(outputs.logits.shape)
 
-        # Step 2: detect head — 全部参与
-        pred_logits = self.detect_head(feat).squeeze(dim=1)  # [B]
-        loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
-
-        # # Step 3: local head — 只对 mask 有效样本计算
-        pred_masks = self.local_head(*features)
+        # Step 2: local head — 只对 mask 有效样本计算
+        pred_masks = outputs.logits  # [B, 1, H, W]
         loss_all = F.binary_cross_entropy_with_logits(
             pred_masks, mask.float(), reduction='none'  # [B, 1, H, W]
         )  # 每个像素的 loss
 
+        
+        # # Step 3: detect head — 全部参与
+        # pred_logits = self.detect_head(feat).squeeze(dim=1)  # [B]
+        # loss_label = F.binary_cross_entropy_with_logits(pred_logits, label)
+        
         # Step 2: 平均成样本级别 [B]
         loss_per_sample = loss_all.view(loss_all.size(0), -1).mean(dim=1)  # [B]
 
@@ -216,20 +201,88 @@ class BisaiBaseline(nn.Module):
         loss_mask = (loss_per_sample * mask_valid).sum() / (num_valid + 1e-6)
 
         return {
-            "backward_loss": loss_label + loss_mask,
+            "backward_loss": loss_mask,
+            # "backward_loss": loss_label + loss_mask,
             'pred_mask' : pred_masks,
-            'pred_label': pred_logits,
+            'pred_label': pred_masks,
             "visual_loss": {
-                "loss_label": loss_label,
+                # "loss_label": loss_label,
+                "loss_label": loss_mask,
                 "loss_mask": loss_mask,
             }
         }
+    
+    def _init_time_related_weights(self):
+        """
+        初始化与时间相关的层（bn_t 和 time_emb_proj）的参数。
+        这些层在加载原始 UperNetForSemanticSegmentation 检查点时通常是未初始化的。
+        """
+        # 定义需要初始化的层名称模式
+        bn_t_names = ["bn_t.bias", "bn_t.weight"]
+        time_emb_proj_names = ["time_emb_proj.bias", "time_emb_proj.weight"]
+        
+        # 记录均值和方差的名称，这些通常由BatchNorm层自动管理，但在初始化时需要归零
+        bn_t_running_stats_names = ["bn_t.running_mean", "bn_t.running_var", "bn_t.num_batches_tracked"]
+
+        print("Initializing newly added time-related weights...")
+
+        for name, module in self.named_modules():
+            # 检查是否是 BatchNorm 层，并初始化其 running_mean, running_var, num_batches_tracked
+            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d):
+                if any(bn_name in name for bn_name in ["bn_t"]): # 匹配 bn_t 层
+                    if module.running_mean is not None:
+                        nn.init.zeros_(module.running_mean)
+                    if module.running_var is not None:
+                        nn.init.ones_(module.running_var) # 方差通常初始化为1
+                    if hasattr(module, 'num_batches_tracked') and module.num_batches_tracked is not None:
+                        module.num_batches_tracked.zero_()
+                    
+                    # 对于可学习的参数（affine=True时），通常按照标准BN初始化
+                    if module.affine:
+                        nn.init.ones_(module.weight) # weight (gamma) 初始化为1
+                        nn.init.zeros_(module.bias)  # bias (beta) 初始化为0
+                    # print(f"Initialized BatchNorm layer: {name}")
+
+            # 检查是否是 Linear 层（time_emb_proj）
+            if isinstance(module, nn.Linear):
+                if any(proj_name in name for proj_name in ["time_emb_proj"]): # 匹配 time_emb_proj
+                    # 权重使用正态分布初始化
+                    nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+                    # 偏差初始化为零
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                    # print(f"Initialized Linear layer: {name}")
+
+        print("Finished initializing time-related weights.")
+    
+    def save_only_transformer(self, output_dir):
+        self.transformer.save_pretrained(output_dir)
+    
+    def load_only_transformer(self, input_dir):
+        self.transformer = UperNetForSemanticSegmentation.from_pretrained(input_dir).to(self.device)
 
 def main():
     import torch
     import random
-    random.seed(42)
-    model = BisaiBaseline().to(0)
+    
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # For multi-GPU setups
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # config = UperNetConfig.from_pretrained("openmmlab/upernet-convnext-large")
+    # model = BisaiBaseline(config).to(device)
+    model = BisaiBaseline.from_pretrained("openmmlab/upernet-convnext-large",num_labels=1,ignore_mismatched_sizes=True).to(device)
+    
+    # model.save_only_transformer("forensichub_checkpoint")
+    # model.load_only_transformer("forensichub_checkpoint")
+    
+    model._init_time_related_weights()
+
     model.eval()
 
     B, C, H, W = 4, 3, 512, 512  # Batch size, channels, image size
@@ -248,7 +301,7 @@ def main():
 
     # 执行前向传播
     with torch.no_grad():
-        out = model(image.to(0), mask.to(0), label.to(0))
+        out = model(image.to(device), mask.to(device), label.to(device))
         
     # torch.onnx.export(
     #     model=model,
@@ -267,6 +320,22 @@ def main():
     print(f"backward_loss: {out['backward_loss'].item():.4f}")
     print(f"loss_label:    {out['visual_loss']['loss_label'].item():.4f}")
     print(f"loss_mask:     {out['visual_loss']['loss_mask'].item():.4f}")
+    
+    print(f"pred_mask:     {out['pred_mask'].shape}")
+    
+    print(f"param")
+    num_params = count_parameters(model)
+    print(f"模型的总可训练参数量: {num_params}")
+    # 或者以百万为单位打印
+    print(f"模型的总可训练参数量: {num_params / 1e6:.2f} M")
+    # print(f"model: {model}")
+        
+def count_parameters(model):
+    """
+    计算模型中可训练参数的总量。
+    """
+    # return sum(p.numel() for p in model.parameters()) # 计算所有参数
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) # 只计算需要梯度的参数
 
 if __name__ == '__main__':
     main()
