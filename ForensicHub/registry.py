@@ -213,7 +213,9 @@ def build_from_registry(registry, config_args):
 
     print(f"[build_from_registry] Creating model '{name}' with args: {config}")
     if name == 'BisaiBaseline':
-        return cls.from_pretrained("openmmlab/upernet-convnext-large",**config)
+        model = cls.from_pretrained("openmmlab/upernet-convnext-large",**config)
+        model._init_time_related_weights()
+        return model
     else:
         return cls(**config)
 
